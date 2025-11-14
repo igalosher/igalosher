@@ -10,6 +10,7 @@
 #include <ctime>
 #include <limits>
 #include <vector>
+#include <array>
 
 struct Rect {
     int16_t x;
@@ -31,6 +32,8 @@ struct FaceProfile {
     String id;
     String name;
     std::vector<uint8_t> descriptor;
+    std::vector<float> lbphFeature;
+    uint8_t sampleCount = 0;
 };
 
 struct MenuItem {
@@ -59,7 +62,13 @@ constexpr float MAX_FACE_BRIGHTNESS = 200.0f;
 constexpr float MIN_SKIN_RATIO = 0.18f;
 constexpr int TIMEZONE_OFFSET_MINUTES = 120;  // Israel GMT+2
 constexpr int DESCRIPTOR_SIZE = 32;
-constexpr float MATCH_THRESHOLD = 18.0f;
+constexpr float MATCH_THRESHOLD = 0.32f;
+constexpr int CAPTURE_SAMPLES = 5;
+constexpr int LBP_GRID_X = 8;
+constexpr int LBP_GRID_Y = 8;
+constexpr int LBP_HIST_BINS = 16;
+constexpr int LBP_FEATURE_LENGTH = LBP_GRID_X * LBP_GRID_Y * LBP_HIST_BINS;
+constexpr float LBP_EPSILON = 1e-6f;
 constexpr unsigned long RECOGNITION_HOLD_MS = 3000;
 
 constexpr uint16_t COLOR_ACCENT = 0x03EF;
@@ -94,12 +103,20 @@ int g_manageScroll = 0;
 int g_selectedProfileIndex = -1;
 
 std::vector<uint8_t> g_latestDescriptor;
+std::vector<float> g_latestFeature;
 unsigned long g_lastDescriptorTime = 0;
 String g_lastMatchName;
 unsigned long g_lastMatchTimestamp = 0;
 bool g_lastFaceDetected = false;
 bool g_captureFaceDetected = false;
 int g_captureVideoBottom = 0;
+bool g_captureInProgress = false;
+int g_captureSamplesCollected = 0;
+unsigned long g_captureLastSampleMs = 0;
+std::vector<float> g_captureFeatureAccumulator;
+std::vector<float> g_pendingFeature;
+uint8_t g_pendingSampleCount = 0;
+float g_lastBestScore = std::numeric_limits<float>::max();
 
 void changeMenuState(MenuState newState) {
     if (g_menuState == newState) {
@@ -107,6 +124,13 @@ void changeMenuState(MenuState newState) {
     }
     g_menuState = newState;
     CoreS3.Display.fillScreen(BLACK);
+    if (g_menuState != MenuState::EnrollCapture) {
+        g_captureInProgress = false;
+        g_captureSamplesCollected = 0;
+        g_captureFeatureAccumulator.clear();
+        g_pendingFeature.clear();
+        g_pendingSampleCount = 0;
+    }
 }
 
 bool detectFaceLikeFeatures(const uint16_t* frame, int width, int height);
@@ -124,8 +148,13 @@ bool deleteProfileFromSd(const String& id);
 void loadProfiles();
 FaceProfile* findProfileById(const String& id);
 std::vector<uint8_t> extractFaceDescriptor(const uint16_t* frame, int width, int height);
-float descriptorDistance(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b);
-void updateRecognition(const std::vector<uint8_t>& descriptor);
+void equalizeDescriptor(std::vector<uint8_t>& descriptor);
+std::vector<float> computeLbphFeature(const std::vector<uint8_t>& descriptor);
+std::vector<float> averageFeatures(const std::vector<float>& baseFeature,
+                                   const std::vector<float>& newFeature,
+                                   uint8_t baseCount);
+float lbphDistance(const std::vector<float>& a, const std::vector<float>& b);
+void updateRecognition(const std::vector<float>& feature);
 void beginEnrollFlow(bool editingExisting, bool renaming, bool recapturing);
 void completeNameEntry();
 void savePendingProfile();
@@ -217,6 +246,11 @@ void drawFaceStatus(bool faceDetected) {
         CoreS3.Display.setTextColor(GREEN, BLACK);
         String label = "Face: ";
         label += g_lastMatchName.isEmpty() ? "Unknown" : g_lastMatchName;
+        if (g_lastBestScore < std::numeric_limits<float>::max()) {
+            label += " (";
+            label += String(g_lastBestScore, 2);
+            label += ")";
+        }
         CoreS3.Display.print(label);
     } else {
         CoreS3.Display.setTextColor(RED, BLACK);
@@ -325,6 +359,13 @@ bool saveProfileToSd(const FaceProfile& profile) {
     if (descriptorLen > 0) {
         file.write(profile.descriptor.data(), descriptorLen);
     }
+    const uint16_t featureLen = static_cast<uint16_t>(profile.lbphFeature.size());
+    file.write(reinterpret_cast<const uint8_t*>(&featureLen), sizeof(featureLen));
+    if (featureLen > 0) {
+        file.write(reinterpret_cast<const uint8_t*>(profile.lbphFeature.data()),
+                   featureLen * sizeof(float));
+    }
+    file.write(&profile.sampleCount, sizeof(profile.sampleCount));
     file.close();
     return true;
 }
@@ -377,6 +418,36 @@ void loadProfiles() {
                 profile.descriptor.resize(descriptorLen);
                 file.read(profile.descriptor.data(), descriptorLen);
             }
+            uint16_t featureLen = 0;
+            if (file.available() >= sizeof(featureLen)) {
+                file.read(reinterpret_cast<uint8_t*>(&featureLen), sizeof(featureLen));
+                if (featureLen > 0 && file.available() >= featureLen * sizeof(float)) {
+                    profile.lbphFeature.resize(featureLen);
+                    file.read(reinterpret_cast<uint8_t*>(profile.lbphFeature.data()),
+                              featureLen * sizeof(float));
+                } else {
+                    featureLen = 0;
+                }
+            }
+            if (file.available() >= sizeof(profile.sampleCount)) {
+                file.read(&profile.sampleCount, sizeof(profile.sampleCount));
+            } else {
+                profile.sampleCount = 1;
+            }
+            if (profile.sampleCount == 0 && !profile.lbphFeature.empty()) {
+                profile.sampleCount = 1;
+            }
+            if (featureLen == 0) {
+                if (descriptorLen == DESCRIPTOR_SIZE * DESCRIPTOR_SIZE) {
+                    profile.lbphFeature = computeLbphFeature(profile.descriptor);
+                } else {
+                    Serial.printf("Profile %s incompatible, please re-enroll.\n",
+                                  profile.id.c_str());
+                    profile.descriptor.clear();
+                    profile.lbphFeature.clear();
+                    profile.sampleCount = 0;
+                }
+            }
             g_profiles.push_back(profile);
         }
         file.close();
@@ -422,23 +493,122 @@ std::vector<uint8_t> extractFaceDescriptor(const uint16_t* frame, int width, int
             descriptor[y * DESCRIPTOR_SIZE + x] = gray;
         }
     }
+    equalizeDescriptor(descriptor);
     return descriptor;
 }
 
-float descriptorDistance(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
+void equalizeDescriptor(std::vector<uint8_t>& descriptor) {
+    if (descriptor.empty()) {
+        return;
+    }
+    std::array<uint32_t, 256> hist{};
+    for (uint8_t value : descriptor) {
+        hist[value]++;
+    }
+    const uint32_t total = descriptor.size();
+    if (total == 0) {
+        return;
+    }
+    std::array<uint8_t, 256> lut{};
+    uint32_t cumulative = 0;
+    for (int i = 0; i < 256; ++i) {
+        cumulative += hist[i];
+        const uint32_t mapped = (cumulative * 255) / total;
+        lut[i] = static_cast<uint8_t>(std::min<uint32_t>(255, mapped));
+    }
+    for (auto& value : descriptor) {
+        value = lut[value];
+    }
+}
+
+std::vector<float> computeLbphFeature(const std::vector<uint8_t>& descriptor) {
+    std::vector<float> feature;
+    if (descriptor.size() != DESCRIPTOR_SIZE * DESCRIPTOR_SIZE) {
+        return feature;
+    }
+    const int size = DESCRIPTOR_SIZE;
+    std::vector<uint8_t> lbp(descriptor.size(), 0);
+    for (int y = 1; y < size - 1; ++y) {
+        for (int x = 1; x < size - 1; ++x) {
+            const uint8_t center = descriptor[y * size + x];
+            uint8_t code = 0;
+            code |= (descriptor[(y - 1) * size + (x - 1)] >= center) << 7;
+            code |= (descriptor[(y - 1) * size + x] >= center) << 6;
+            code |= (descriptor[(y - 1) * size + (x + 1)] >= center) << 5;
+            code |= (descriptor[y * size + (x + 1)] >= center) << 4;
+            code |= (descriptor[(y + 1) * size + (x + 1)] >= center) << 3;
+            code |= (descriptor[(y + 1) * size + x] >= center) << 2;
+            code |= (descriptor[(y + 1) * size + (x - 1)] >= center) << 1;
+            code |= (descriptor[y * size + (x - 1)] >= center);
+            lbp[y * size + x] = code;
+        }
+    }
+
+    const int cellW = size / LBP_GRID_X;
+    const int cellH = size / LBP_GRID_Y;
+    feature.assign(LBP_FEATURE_LENGTH, 0.0f);
+
+    int histIndex = 0;
+    for (int gy = 0; gy < LBP_GRID_Y; ++gy) {
+        for (int gx = 0; gx < LBP_GRID_X; ++gx) {
+            const int startX = gx * cellW;
+            const int startY = gy * cellH;
+            std::array<float, LBP_HIST_BINS> hist{};
+            for (int y = 0; y < cellH; ++y) {
+                for (int x = 0; x < cellW; ++x) {
+                    const uint8_t val = lbp[(startY + y) * size + (startX + x)];
+                    const int bin = std::min(LBP_HIST_BINS - 1, static_cast<int>(val / (256 / LBP_HIST_BINS)));
+                    hist[bin] += 1.0f;
+                }
+            }
+            float histSum = 0.0f;
+            for (float v : hist) {
+                histSum += v;
+            }
+            const float inv = histSum > 0.0f ? (1.0f / histSum) : 0.0f;
+            for (int b = 0; b < LBP_HIST_BINS; ++b) {
+                feature[histIndex++] = hist[b] * inv;
+            }
+        }
+    }
+    return feature;
+}
+
+std::vector<float> averageFeatures(const std::vector<float>& baseFeature,
+                                   const std::vector<float>& newFeature,
+                                   uint8_t baseCount) {
+    if (baseFeature.empty()) {
+        return newFeature;
+    }
+    if (newFeature.empty() || baseFeature.size() != newFeature.size()) {
+        return baseFeature;
+    }
+    std::vector<float> result(baseFeature.size(), 0.0f);
+    const float total = static_cast<float>(baseCount) + 1.0f;
+    const float weightBase = static_cast<float>(baseCount) / total;
+    const float weightNew = 1.0f / total;
+    for (size_t i = 0; i < baseFeature.size(); ++i) {
+        result[i] = baseFeature[i] * weightBase + newFeature[i] * weightNew;
+    }
+    return result;
+}
+
+float lbphDistance(const std::vector<float>& a, const std::vector<float>& b) {
     if (a.size() != b.size() || a.empty()) {
         return std::numeric_limits<float>::max();
     }
     float sum = 0.0f;
     for (size_t i = 0; i < a.size(); ++i) {
-        const float diff = static_cast<float>(a[i]) - static_cast<float>(b[i]);
-        sum += diff * diff;
+        const float num = a[i] - b[i];
+        const float denom = a[i] + b[i] + LBP_EPSILON;
+        sum += (num * num) / denom;
     }
-    return sqrtf(sum / a.size());
+    return 0.5f * sum;
 }
 
-void updateRecognition(const std::vector<uint8_t>& descriptor) {
-    if (descriptor.empty() || g_profiles.empty()) {
+void updateRecognition(const std::vector<float>& feature) {
+    if (feature.empty() || g_profiles.empty()) {
+        g_lastBestScore = std::numeric_limits<float>::max();
         if (millis() > g_lastMatchTimestamp + RECOGNITION_HOLD_MS) {
             g_lastMatchName = "";
         }
@@ -448,16 +618,17 @@ void updateRecognition(const std::vector<uint8_t>& descriptor) {
     float bestScore = std::numeric_limits<float>::max();
     String bestName;
     for (const auto& profile : g_profiles) {
-        if (profile.descriptor.empty()) {
+        if (profile.lbphFeature.empty()) {
             continue;
         }
-        const float score = descriptorDistance(descriptor, profile.descriptor);
+        const float score = lbphDistance(feature, profile.lbphFeature);
         if (score < bestScore) {
             bestScore = score;
             bestName = profile.name;
         }
     }
 
+    g_lastBestScore = bestScore;
     if (bestScore < MATCH_THRESHOLD) {
         g_lastMatchName = bestName;
         g_lastMatchTimestamp = millis();
@@ -475,6 +646,8 @@ void beginEnrollFlow(bool editingExisting, bool renaming, bool recapturing) {
         g_pendingName = "";
     }
     g_pendingDescriptor.clear();
+    g_pendingFeature.clear();
+    g_pendingSampleCount = 0;
     g_inputBuffer = renaming ? g_pendingName : "";
     MenuState target = renaming ? MenuState::EnrollName :
                        (recapturing ? MenuState::EnrollCapture : MenuState::EnrollName);
@@ -501,8 +674,8 @@ void completeNameEntry() {
 }
 
 void savePendingProfile() {
-    if (g_pendingDescriptor.empty()) {
-        showStatusMessage("Capture a face first", 1500);
+    if (g_pendingDescriptor.empty() || g_pendingFeature.empty() || g_pendingSampleCount == 0) {
+        showStatusMessage("Capture face samples first", 1500);
         return;
     }
     if (g_pendingName.isEmpty()) {
@@ -514,6 +687,10 @@ void savePendingProfile() {
         auto* profile = findProfileById(g_editingProfileId);
         if (profile) {
             profile->descriptor = g_pendingDescriptor;
+            profile->lbphFeature =
+                averageFeatures(profile->lbphFeature, g_pendingFeature, profile->sampleCount);
+            profile->sampleCount =
+                std::min<uint8_t>(255, profile->sampleCount + g_pendingSampleCount);
             profile->name = g_pendingName;
             saveProfileToSd(*profile);
             showStatusMessage("Profile updated", 1500);
@@ -523,10 +700,15 @@ void savePendingProfile() {
         profile.id = String(millis());
         profile.name = g_pendingName;
         profile.descriptor = g_pendingDescriptor;
+        profile.lbphFeature = g_pendingFeature;
+        profile.sampleCount = g_pendingSampleCount;
         g_profiles.push_back(profile);
         saveProfileToSd(g_profiles.back());
         showStatusMessage("Person saved", 1500);
     }
+    g_pendingDescriptor.clear();
+    g_pendingFeature.clear();
+    g_pendingSampleCount = 0;
     changeMenuState(MenuState::Main);
 }
 
@@ -624,7 +806,13 @@ void drawCapturePanel(const Rect& panel) {
     CoreS3.Display.setCursor(panel.x + padding, controlsTop - 38);
     CoreS3.Display.print(g_captureFaceDetected ? "Face detected" : "No face detected");
     CoreS3.Display.setCursor(panel.x + padding, controlsTop - 20);
-    CoreS3.Display.print("Align face then tap Capture");
+    if (g_captureInProgress) {
+        CoreS3.Display.print(String("Capturing ") + g_captureSamplesCollected + "/" + CAPTURE_SAMPLES);
+    } else if (g_pendingSampleCount > 0) {
+        CoreS3.Display.print(String("Samples ready: ") + g_pendingSampleCount);
+    } else {
+        CoreS3.Display.print("Tap Capture to record samples");
+    }
 
     int y = controlsTop;
     Rect captureBtn = makeRect(panel.x + padding, y, panel.w - 2 * padding, 38);
@@ -788,12 +976,21 @@ void dispatchMenuAction(const String& action, const String& value) {
         return;
     }
     if (action == "capture_face") {
-        if (g_latestDescriptor.empty()) {
-            showStatusMessage("No face detected", 1500);
-        } else {
-            g_pendingDescriptor = g_latestDescriptor;
-            showStatusMessage("Face captured", 1500);
+        if (g_captureInProgress) {
+            showStatusMessage("Already capturing...", 1000);
+            return;
         }
+        if (g_latestFeature.empty()) {
+            showStatusMessage("No face detected", 1500);
+            return;
+        }
+        g_captureInProgress = true;
+        g_captureSamplesCollected = 0;
+        g_captureFeatureAccumulator.clear();
+        g_captureLastSampleMs = 0;
+        g_pendingFeature.clear();
+        g_pendingSampleCount = 0;
+        showStatusMessage("Capturing samples...", 1200);
         return;
     }
     if (action == "save_profile") {
@@ -955,10 +1152,12 @@ void loop() {
             g_latestDescriptor =
                 extractFaceDescriptor(reinterpret_cast<uint16_t*>(CoreS3.Camera.fb->buf),
                                       frameWidth, frameHeight);
+            g_latestFeature = computeLbphFeature(g_latestDescriptor);
             g_lastDescriptorTime = millis();
-            updateRecognition(g_latestDescriptor);
+            updateRecognition(g_latestFeature);
         } else if (millis() > g_lastDescriptorTime + 1500) {
             g_latestDescriptor.clear();
+            g_latestFeature.clear();
         }
 
         g_lastFaceDetected = faceDetected;
@@ -972,6 +1171,36 @@ void loop() {
         if (isCaptureView) {
             g_captureVideoBottom = videoTop + targetHeight;
             g_captureFaceDetected = faceDetected;
+            if (g_captureInProgress && faceDetected && !g_latestFeature.empty()) {
+                const unsigned long now = millis();
+                if (now - g_captureLastSampleMs > 200) {
+                    if (g_captureFeatureAccumulator.empty()) {
+                        g_captureFeatureAccumulator.assign(g_latestFeature.size(), 0.0f);
+                    }
+                    for (size_t i = 0; i < g_latestFeature.size(); ++i) {
+                        g_captureFeatureAccumulator[i] += g_latestFeature[i];
+                    }
+                    g_captureSamplesCollected++;
+                    g_captureLastSampleMs = now;
+                    showStatusMessage(String("Sample ") + g_captureSamplesCollected + "/" +
+                                          CAPTURE_SAMPLES,
+                                      600);
+                    if (g_captureSamplesCollected >= CAPTURE_SAMPLES) {
+                        g_pendingFeature.resize(g_captureFeatureAccumulator.size());
+                        for (size_t i = 0; i < g_captureFeatureAccumulator.size(); ++i) {
+                            g_pendingFeature[i] =
+                                g_captureFeatureAccumulator[i] / g_captureSamplesCollected;
+                        }
+                        g_pendingDescriptor = g_latestDescriptor;
+                        g_pendingSampleCount = static_cast<uint8_t>(
+                            std::min(CAPTURE_SAMPLES, g_captureSamplesCollected));
+                        g_captureInProgress = false;
+                        g_captureFeatureAccumulator.clear();
+                        g_captureSamplesCollected = 0;
+                        showStatusMessage("Samples ready", 1500);
+                    }
+                }
+            }
         }
 
         const int buttonHeight = targetHeight;

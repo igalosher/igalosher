@@ -580,10 +580,10 @@ void drawNameEntry(const Rect& panel) {
     CoreS3.Display.print("Name: ");
     CoreS3.Display.print(g_inputBuffer);
 
-    const char* rows[] = {"ABCDEFGH", "IJKLMNOP", "QRSTUVWXYZ"};
-    const int btnW = 32;
-    const int btnH = 32;
-    int y = panel.y + padding + 28;
+    const char* rows[] = {"ABCDEFGH", "IJKLMNOP", "QRSTUV", "WXYZ"};
+    const int btnW = 30;
+    const int btnH = 30;
+    int y = panel.y + padding + 24;
     for (const char* row : rows) {
         const int len = strlen(row);
         int x = panel.x + padding;
@@ -591,18 +591,18 @@ void drawNameEntry(const Rect& panel) {
             Rect r = makeRect(x, y, btnW, btnH);
             String letter(row[i]);
             addMenuButtonInternal(r, letter, COLOR_SUCCESS, "letter", letter);
-            x += btnW + 6;
+            x += btnW + 5;
         }
-        y += btnH + 6;
+        y += btnH + 5;
     }
-    Rect spaceBtn = makeRect(panel.x + padding, y, 80, 32);
-    Rect backspaceBtn = makeRect(spaceBtn.x + spaceBtn.w + 6, y, 80, 32);
-    Rect clearBtn = makeRect(backspaceBtn.x + backspaceBtn.w + 6, y, 80, 32);
+    Rect spaceBtn = makeRect(panel.x + padding, y, 70, 30);
+    Rect backspaceBtn = makeRect(spaceBtn.x + spaceBtn.w + 5, y, 70, 30);
+    Rect clearBtn = makeRect(backspaceBtn.x + backspaceBtn.w + 5, y, 70, 30);
     addMenuButtonInternal(spaceBtn, "Space", COLOR_ACCENT, "space");
     addMenuButtonInternal(backspaceBtn, "Del", COLOR_MUTED, "backspace");
     addMenuButtonInternal(clearBtn, "Clear", COLOR_MUTED, "clear");
-    y += 36;
-    Rect nextBtn = makeRect(panel.x + padding, y, panel.w - 2 * padding, 40);
+    y += 34;
+    Rect nextBtn = makeRect(panel.x + padding, y, panel.w - 2 * padding, 36);
     addMenuButtonInternal(nextBtn, g_isRenaming ? "Save Name" : "Next", COLOR_ACCENT, "confirm_name");
 }
 
@@ -860,11 +860,8 @@ void handleTap(int16_t x, int16_t y) {
         }
     }
 
-    const Rect panel{10, 10, static_cast<int16_t>(CoreS3.Display.width() - 20),
-                     static_cast<int16_t>(CoreS3.Display.height() - 20)};
-    if (!(x >= panel.x && x <= panel.x + panel.w && y >= panel.y && y <= panel.y + panel.h)) {
-        changeMenuState(MenuState::Hidden);
-    }
+    (void)x;
+    (void)y;
 }
 
 void setup() {

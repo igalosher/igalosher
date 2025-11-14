@@ -110,10 +110,6 @@ unsigned long g_lastMatchTimestamp = 0;
 bool g_lastFaceDetected = false;
 bool g_captureFaceDetected = false;
 int g_captureVideoBottom = 0;
-bool g_captureInProgress = false;
-int g_captureSamplesCollected = 0;
-unsigned long g_captureLastSampleMs = 0;
-std::vector<float> g_captureFeatureAccumulator;
 std::vector<float> g_pendingFeature;
 uint8_t g_pendingSampleCount = 0;
 float g_lastBestScore = std::numeric_limits<float>::max();
@@ -125,9 +121,6 @@ void changeMenuState(MenuState newState) {
     g_menuState = newState;
     CoreS3.Display.fillScreen(BLACK);
     if (g_menuState != MenuState::EnrollCapture) {
-        g_captureInProgress = false;
-        g_captureSamplesCollected = 0;
-        g_captureFeatureAccumulator.clear();
         g_pendingFeature.clear();
         g_pendingSampleCount = 0;
     }
@@ -806,10 +799,8 @@ void drawCapturePanel(const Rect& panel) {
     CoreS3.Display.setCursor(panel.x + padding, controlsTop - 38);
     CoreS3.Display.print(g_captureFaceDetected ? "Face detected" : "No face detected");
     CoreS3.Display.setCursor(panel.x + padding, controlsTop - 20);
-    if (g_captureInProgress) {
-        CoreS3.Display.print(String("Capturing ") + g_captureSamplesCollected + "/" + CAPTURE_SAMPLES);
-    } else if (g_pendingSampleCount > 0) {
-        CoreS3.Display.print(String("Samples ready: ") + g_pendingSampleCount);
+    if (g_pendingSampleCount > 0) {
+        CoreS3.Display.print(String("Samples: ") + g_pendingSampleCount + "/" + CAPTURE_SAMPLES);
     } else {
         CoreS3.Display.print("Tap Capture to record samples");
     }
@@ -976,21 +967,21 @@ void dispatchMenuAction(const String& action, const String& value) {
         return;
     }
     if (action == "capture_face") {
-        if (g_captureInProgress) {
-            showStatusMessage("Already capturing...", 1000);
-            return;
-        }
         if (g_latestFeature.empty()) {
             showStatusMessage("No face detected", 1500);
             return;
         }
-        g_captureInProgress = true;
-        g_captureSamplesCollected = 0;
-        g_captureFeatureAccumulator.clear();
-        g_captureLastSampleMs = 0;
-        g_pendingFeature.clear();
-        g_pendingSampleCount = 0;
-        showStatusMessage("Capturing samples...", 1200);
+        if (g_pendingSampleCount == 0) {
+            g_pendingFeature = g_latestFeature;
+            g_pendingDescriptor = g_latestDescriptor;
+        } else {
+            g_pendingFeature =
+                averageFeatures(g_pendingFeature, g_latestFeature, g_pendingSampleCount);
+            g_pendingDescriptor = g_latestDescriptor;
+        }
+        g_pendingSampleCount =
+            std::min<uint8_t>(CAPTURE_SAMPLES, static_cast<uint8_t>(g_pendingSampleCount + 1));
+        showStatusMessage(String("Sample ") + g_pendingSampleCount + "/" + CAPTURE_SAMPLES, 1000);
         return;
     }
     if (action == "save_profile") {
@@ -999,6 +990,8 @@ void dispatchMenuAction(const String& action, const String& value) {
         return;
     }
     if (action == "cancel_capture") {
+        g_pendingFeature.clear();
+        g_pendingSampleCount = 0;
         changeMenuState(MenuState::Main);
         return;
     }
@@ -1171,36 +1164,6 @@ void loop() {
         if (isCaptureView) {
             g_captureVideoBottom = videoTop + targetHeight;
             g_captureFaceDetected = faceDetected;
-            if (g_captureInProgress && faceDetected && !g_latestFeature.empty()) {
-                const unsigned long now = millis();
-                if (now - g_captureLastSampleMs > 200) {
-                    if (g_captureFeatureAccumulator.empty()) {
-                        g_captureFeatureAccumulator.assign(g_latestFeature.size(), 0.0f);
-                    }
-                    for (size_t i = 0; i < g_latestFeature.size(); ++i) {
-                        g_captureFeatureAccumulator[i] += g_latestFeature[i];
-                    }
-                    g_captureSamplesCollected++;
-                    g_captureLastSampleMs = now;
-                    showStatusMessage(String("Sample ") + g_captureSamplesCollected + "/" +
-                                          CAPTURE_SAMPLES,
-                                      600);
-                    if (g_captureSamplesCollected >= CAPTURE_SAMPLES) {
-                        g_pendingFeature.resize(g_captureFeatureAccumulator.size());
-                        for (size_t i = 0; i < g_captureFeatureAccumulator.size(); ++i) {
-                            g_pendingFeature[i] =
-                                g_captureFeatureAccumulator[i] / g_captureSamplesCollected;
-                        }
-                        g_pendingDescriptor = g_latestDescriptor;
-                        g_pendingSampleCount = static_cast<uint8_t>(
-                            std::min(CAPTURE_SAMPLES, g_captureSamplesCollected));
-                        g_captureInProgress = false;
-                        g_captureFeatureAccumulator.clear();
-                        g_captureSamplesCollected = 0;
-                        showStatusMessage("Samples ready", 1500);
-                    }
-                }
-            }
         }
 
         const int buttonHeight = targetHeight;

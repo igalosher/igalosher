@@ -98,6 +98,8 @@ unsigned long g_lastDescriptorTime = 0;
 String g_lastMatchName;
 unsigned long g_lastMatchTimestamp = 0;
 bool g_lastFaceDetected = false;
+bool g_captureFaceDetected = false;
+int g_captureVideoBottom = 0;
 
 void changeMenuState(MenuState newState) {
     if (g_menuState == newState) {
@@ -598,30 +600,37 @@ void drawNameEntry(const Rect& panel) {
     Rect spaceBtn = makeRect(panel.x + padding, y, 70, 30);
     Rect backspaceBtn = makeRect(spaceBtn.x + spaceBtn.w + 5, y, 70, 30);
     Rect clearBtn = makeRect(backspaceBtn.x + backspaceBtn.w + 5, y, 70, 30);
+    Rect kbBackBtn = makeRect(clearBtn.x + clearBtn.w + 5, y, 60, 30);
     addMenuButtonInternal(spaceBtn, "Space", COLOR_ACCENT, "space");
     addMenuButtonInternal(backspaceBtn, "Del", COLOR_MUTED, "backspace");
     addMenuButtonInternal(clearBtn, "Clear", COLOR_MUTED, "clear");
+    addMenuButtonInternal(kbBackBtn, "Back", COLOR_MUTED, "menu_back");
     y += 34;
     Rect nextBtn = makeRect(panel.x + padding, y, panel.w - 2 * padding, 36);
     addMenuButtonInternal(nextBtn, g_isRenaming ? "Save Name" : "Next", COLOR_ACCENT, "confirm_name");
 }
 
 void drawCapturePanel(const Rect& panel) {
-    const int padding = 10;
+    const int padding = 8;
+    const int controlsTop = (g_captureVideoBottom > 0 ? g_captureVideoBottom + 40
+                                                     : CoreS3.Display.height() / 2 + 20);
+
     CoreS3.Display.setTextSize(2);
     CoreS3.Display.setTextColor(WHITE, BLACK);
-    CoreS3.Display.setCursor(panel.x + padding, panel.y + padding);
-    CoreS3.Display.print("Align face then capture");
+    CoreS3.Display.fillRect(panel.x + padding, controlsTop - 40, panel.w - 2 * padding, 36, BLACK);
+    CoreS3.Display.setCursor(panel.x + padding, controlsTop - 38);
+    CoreS3.Display.print(g_captureFaceDetected ? "Face detected" : "No face detected");
+    CoreS3.Display.setCursor(panel.x + padding, controlsTop - 20);
+    CoreS3.Display.print("Align face then tap Capture");
 
-    int y = panel.y + padding + 30;
-    Rect captureBtn = makeRect(panel.x + padding, y, panel.w - 2 * padding, 40);
+    int y = controlsTop;
+    Rect captureBtn = makeRect(panel.x + padding, y, panel.w - 2 * padding, 38);
     addMenuButtonInternal(captureBtn, "Capture", COLOR_SUCCESS, "capture_face");
-    y += 50;
-    Rect saveBtn = makeRect(panel.x + padding, y, panel.w - 2 * padding, 40);
+    y += 46;
+    Rect saveBtn = makeRect(panel.x + padding, y, (panel.w - 3 * padding) / 2, 38);
+    Rect backBtn = makeRect(saveBtn.x + saveBtn.w + padding, y, (panel.w - 3 * padding) / 2, 38);
     addMenuButtonInternal(saveBtn, "Save", COLOR_ACCENT, "save_profile");
-    y += 50;
-    Rect cancelBtn = makeRect(panel.x + padding, y, panel.w - 2 * padding, 40);
-    addMenuButtonInternal(cancelBtn, "Cancel", COLOR_MUTED, "cancel_capture");
+    addMenuButtonInternal(backBtn, "Back", COLOR_MUTED, "cancel_capture");
 }
 
 void drawManageList(const Rect& panel) {
@@ -701,15 +710,19 @@ void drawMenuOverlay() {
     const Rect panel = makeRect(0, 0, CoreS3.Display.width(), CoreS3.Display.height());
     g_menuItems.clear();
 
+    if (g_menuState == MenuState::EnrollCapture) {
+        drawCapturePanel(panel);
+        return;
+    }
+
+    CoreS3.Display.drawRoundRect(panel.x + 4, panel.y + 4, panel.w - 8, panel.h - 8, 12, WHITE);
+
     switch (g_menuState) {
         case MenuState::Main:
             drawMainMenu(panel);
             break;
         case MenuState::EnrollName:
             drawNameEntry(panel);
-            break;
-        case MenuState::EnrollCapture:
-            drawCapturePanel(panel);
             break;
         case MenuState::ManageList:
             drawManageList(panel);
@@ -907,17 +920,23 @@ void loop() {
     auto touchDetail = CoreS3.Touch.getDetail();
     const bool tapped = touchDetail.wasClicked();
 
-    const bool menuActive = (g_menuState != MenuState::Hidden);
+    const bool isCaptureView = (g_menuState == MenuState::EnrollCapture);
+    const bool wantsCamera = (g_menuState == MenuState::Hidden) || isCaptureView;
 
-    if (!menuActive && CoreS3.Camera.get()) {
+    if (wantsCamera && CoreS3.Camera.get()) {
         const int frameWidth = CoreS3.Camera.fb->width;
         const int frameHeight = CoreS3.Camera.fb->height;
-        const int targetHeight = static_cast<int>(frameHeight * VIDEO_SCALE);
+        float scale = VIDEO_SCALE;
+        if (isCaptureView) {
+            const float maxHeight = CoreS3.Display.height() * 0.45f;
+            scale = std::min(scale, maxHeight / frameHeight);
+        }
+        const int targetHeight = static_cast<int>(frameHeight * scale);
 
         const int displayWidth = CoreS3.Display.width();
         const int displayHeight = CoreS3.Display.height();
-        const int reservedTop = STATUS_HEIGHT + DATETIME_HEIGHT;
-        const int videoTop = std::max(reservedTop, displayHeight - targetHeight);
+        const int videoTop = isCaptureView ? 10 : std::max(STATUS_HEIGHT + DATETIME_HEIGHT,
+                                                           displayHeight - targetHeight);
 
         const float centerX = displayWidth * 0.5f;
         const float centerY = videoTop + targetHeight * 0.5f;
@@ -946,6 +965,11 @@ void loop() {
                                            0.0f, VIDEO_SCALE, VIDEO_SCALE,
                                            frameWidth, frameHeight,
                                            reinterpret_cast<uint16_t*>(CoreS3.Camera.fb->buf));
+
+        if (isCaptureView) {
+            g_captureVideoBottom = videoTop + targetHeight;
+            g_captureFaceDetected = faceDetected;
+        }
 
         const int buttonHeight = targetHeight;
         if (g_menuState == MenuState::Hidden) {

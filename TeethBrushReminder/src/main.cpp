@@ -578,7 +578,10 @@ void drawNameEntry(const Rect& panel) {
     const int padding = 6;
     CoreS3.Display.setTextSize(2);
     CoreS3.Display.setTextColor(WHITE, BLACK);
-    CoreS3.Display.setCursor(panel.x + padding, panel.y + padding);
+    const int labelHeight = CoreS3.Display.fontHeight() + 6;
+    CoreS3.Display.fillRect(panel.x + padding, panel.y + padding,
+                            panel.w - 2 * padding, labelHeight, BLACK);
+    CoreS3.Display.setCursor(panel.x + padding, panel.y + padding + 2);
     CoreS3.Display.print("Name: ");
     CoreS3.Display.print(g_inputBuffer);
 
